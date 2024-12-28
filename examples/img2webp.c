@@ -28,6 +28,7 @@
 #include "../imageio/imageio_util.h"
 #include "./stopwatch.h"
 #include "./unicode.h"
+#include "sharpyuv/sharpyuv.h"
 #include "webp/encode.h"
 #include "webp/mux.h"
 
@@ -35,18 +36,22 @@
 
 static void Help(void) {
   printf("Usage:\n\n");
-  printf("  img2webp [file-level options] [image files...] "
-         "[per-frame options...]\n");
-  printf("\n");
+  printf("  img2webp [file_options] [[frame_options] frame_file]...");
+  printf(" [-o webp_file]\n\n");
 
   printf("File-level options (only used at the start of compression):\n");
   printf(" -min_size ............ minimize size\n");
-  printf(" -loop <int> .......... loop count (default: 0, = infinite loop)\n");
   printf(" -kmax <int> .......... maximum number of frame between key-frames\n"
          "                        (0=only keyframes)\n");
   printf(" -kmin <int> .......... minimum number of frame between key-frames\n"
          "                        (0=disable key-frames altogether)\n");
   printf(" -mixed ............... use mixed lossy/lossless automatic mode\n");
+  printf(" -near_lossless <int> . use near-lossless image preprocessing\n"
+         "                        (0..100=off), default=100\n");
+  printf(" -sharp_yuv ........... use sharper (and slower) RGB->YUV "
+                                  "conversion\n                        "
+                                  "(lossy only)\n");
+  printf(" -loop <int> .......... loop count (default: 0, = infinite loop)\n");
   printf(" -v ................... verbose mode\n");
   printf(" -h ................... this help\n");
   printf(" -version ............. print version number and exit\n");
@@ -54,10 +59,15 @@ static void Help(void) {
 
   printf("Per-frame options (only used for subsequent images input):\n");
   printf(" -d <int> ............. frame duration in ms (default: 100)\n");
-  printf(" -lossless  ........... use lossless mode (default)\n");
-  printf(" -lossy ... ........... use lossy mode\n");
+  printf(" -lossless ............ use lossless mode (default)\n");
+  printf(" -lossy ............... use lossy mode\n");
   printf(" -q <float> ........... quality\n");
-  printf(" -m <int> ............. method to use\n");
+  printf(" -m <int> ............. compression method (0=fast, 6=slowest), "
+         "default=4\n");
+  printf(" -exact, -noexact ..... preserve or alter RGB values in transparent "
+                                  "area\n"
+         "                        (default: -noexact, may cause artifacts\n"
+         "                                  with lossy animations)\n");
 
   printf("\n");
   printf("example: img2webp -loop 2 in0.png -lossy in1.jpg\n"
@@ -66,6 +76,8 @@ static void Help(void) {
          "arguments will be\n");
   printf("tokenized from this file. The file name must not start with "
          "the character '-'.\n");
+  printf("\nSupported input formats:\n  %s\n",
+         WebPGetEnabledInputFileFormats());
 }
 
 //------------------------------------------------------------------------------
@@ -123,6 +135,7 @@ static int SetLoopCount(int loop_count, WebPData* const webp_data) {
 
 //------------------------------------------------------------------------------
 
+// Returns EXIT_SUCCESS on success, EXIT_FAILURE on failure.
 int main(int argc, const char* argv[]) {
   const char* output = NULL;
   WebPAnimEncoder* enc = NULL;
@@ -138,13 +151,14 @@ int main(int argc, const char* argv[]) {
   WebPData webp_data;
   int c;
   int have_input = 0;
+  int last_input_index = 0;
   CommandLineArguments cmd_args;
   int ok;
 
   INIT_WARGV(argc, argv);
 
   ok = ExUtilInitCommandLineArguments(argc - 1, argv + 1, &cmd_args);
-  if (!ok) FREE_WARGV_AND_RETURN(1);
+  if (!ok) FREE_WARGV_AND_RETURN(EXIT_FAILURE);
 
   argc = cmd_args.argc_;
   argv = cmd_args.argv_;
@@ -183,18 +197,26 @@ int main(int argc, const char* argv[]) {
       } else if (!strcmp(argv[c], "-mixed")) {
         anim_config.allow_mixed = 1;
         config.lossless = 0;
+      } else if (!strcmp(argv[c], "-near_lossless") && c + 1 < argc) {
+        argv[c] = NULL;
+        config.near_lossless = ExUtilGetInt(argv[++c], 0, &parse_error);
+      } else if (!strcmp(argv[c], "-sharp_yuv")) {
+        config.use_sharp_yuv = 1;
       } else if (!strcmp(argv[c], "-v")) {
         verbose = 1;
       } else if (!strcmp(argv[c], "-h") || !strcmp(argv[c], "-help")) {
         Help();
-        goto End;
+        FREE_WARGV_AND_RETURN(EXIT_SUCCESS);
       } else if (!strcmp(argv[c], "-version")) {
         const int enc_version = WebPGetEncoderVersion();
         const int mux_version = WebPGetMuxVersion();
+        const int sharpyuv_version = SharpYuvGetVersion();
         printf("WebP Encoder version: %d.%d.%d\nWebP Mux version: %d.%d.%d\n",
                (enc_version >> 16) & 0xff, (enc_version >> 8) & 0xff,
                enc_version & 0xff, (mux_version >> 16) & 0xff,
                (mux_version >> 8) & 0xff, mux_version & 0xff);
+        printf("libsharpyuv: %d.%d.%d\n", (sharpyuv_version >> 24) & 0xff,
+               (sharpyuv_version >> 16) & 0xffff, sharpyuv_version & 0xff);
         goto End;
       } else {
         continue;
@@ -208,6 +230,8 @@ int main(int argc, const char* argv[]) {
   }
   if (!have_input) {
     fprintf(stderr, "No input file(s) for generating animation!\n");
+    ok = 0;
+    Help();
     goto End;
   }
 
@@ -232,6 +256,10 @@ int main(int argc, const char* argv[]) {
           fprintf(stderr, "Invalid negative duration (%d)\n", duration);
           parse_error = 1;
         }
+      } else if (!strcmp(argv[c], "-exact")) {
+        config.exact = 1;
+      } else if (!strcmp(argv[c], "-noexact")) {
+        config.exact = 0;
       } else {
         parse_error = 1;   // shouldn't be here.
         fprintf(stderr, "Unknown option [%s]\n", argv[c]);
@@ -252,6 +280,7 @@ int main(int argc, const char* argv[]) {
     // read next input image
     pic.use_argb = 1;
     ok = ReadImage((const char*)GET_WARGV_SHIFTED(argv, c), &pic);
+    last_input_index = c;
     if (!ok) goto End;
 
     if (enc == NULL) {
@@ -290,6 +319,13 @@ int main(int argc, const char* argv[]) {
     ++pic_num;
   }
 
+  for (c = last_input_index + 1; c < argc; ++c) {
+    if (argv[c] != NULL) {
+      fprintf(stderr, "Warning: unused option [%s]!"
+                      " Frame options go before the input frame.\n", argv[c]);
+    }
+  }
+
   // add a last fake frame to signal the last duration
   ok = ok && WebPAnimEncoderAdd(enc, NULL, timestamp_ms, NULL);
   ok = ok && WebPAnimEncoderAssemble(enc, &webp_data);
@@ -320,5 +356,5 @@ int main(int argc, const char* argv[]) {
   }
   WebPDataClear(&webp_data);
   ExUtilDeleteCommandLineArguments(&cmd_args);
-  FREE_WARGV_AND_RETURN(ok ? 0 : 1);
+  FREE_WARGV_AND_RETURN(ok ? EXIT_SUCCESS : EXIT_FAILURE);
 }

@@ -89,6 +89,11 @@ int ImgIoUtilReadFile(const char* const file_name,
   }
   fseek(in, 0, SEEK_END);
   file_size = ftell(in);
+  if (file_size == (size_t)-1) {
+    fclose(in);
+    WFPRINTF(stderr, "error getting size of '%s'\n", (const W_CHAR*)file_name);
+    return 0;
+  }
   fseek(in, 0, SEEK_SET);
   // we allocate one extra byte for the \0 terminator
   file_data = (uint8_t*)WebPMalloc(file_size + 1);
@@ -148,9 +153,11 @@ void ImgIoUtilCopyPlane(const uint8_t* src, int src_stride,
 
 // -----------------------------------------------------------------------------
 
-int ImgIoUtilCheckSizeArgumentsOverflow(uint64_t nmemb, size_t size) {
-  const uint64_t total_size = nmemb * size;
+int ImgIoUtilCheckSizeArgumentsOverflow(uint64_t stride, size_t height) {
+  const uint64_t total_size = stride * height;
   int ok = (total_size == (size_t)total_size);
+  // check that 'stride' is representable as int:
+  ok = ok && ((uint64_t)(int)stride == stride);
 #if defined(WEBP_MAX_IMAGE_SIZE)
   ok = ok && (total_size <= (uint64_t)WEBP_MAX_IMAGE_SIZE);
 #endif

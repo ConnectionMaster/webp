@@ -27,6 +27,7 @@
 #include "../imageio/webpdec.h"
 #include "./stopwatch.h"
 #include "./unicode.h"
+#include "sharpyuv/sharpyuv.h"
 #include "webp/encode.h"
 
 #ifndef WEBP_DLL
@@ -177,8 +178,14 @@ static void PrintFullLosslessInfo(const WebPAuxStats* const stats,
     if (stats->lossless_features & 8) fprintf(stderr, " PALETTE");
     fprintf(stderr, "\n");
   }
-  fprintf(stderr, "  * Precision Bits: histogram=%d transform=%d cache=%d\n",
-          stats->histogram_bits, stats->transform_bits, stats->cache_bits);
+  fprintf(stderr, "  * Precision Bits: histogram=%d", stats->histogram_bits);
+  if (stats->lossless_features & 1) {
+    fprintf(stderr, " prediction=%d", stats->transform_bits);
+  }
+  if (stats->lossless_features & 2) {
+    fprintf(stderr, " cross-color=%d", stats->cross_color_transform_bits);
+  }
+  fprintf(stderr, " cache=%d\n", stats->cache_bits);
   if (stats->palette_size > 0) {
     fprintf(stderr, "  * Palette size:   %d\n", stats->palette_size);
   }
@@ -305,6 +312,7 @@ static int MyWriter(const uint8_t* data, size_t data_size,
 // Dumps a picture as a PGM file using the IMC4 layout.
 static int DumpPicture(const WebPPicture* const picture, const char* PGM_name) {
   int y;
+  int ok = 0;
   const int uv_width = (picture->width + 1) / 2;
   const int uv_height = (picture->height + 1) / 2;
   const int stride = (picture->width + 1) & ~1;
@@ -319,23 +327,26 @@ static int DumpPicture(const WebPPicture* const picture, const char* PGM_name) {
   if (f == NULL) return 0;
   fprintf(f, "P5\n%d %d\n255\n", stride, height);
   for (y = 0; y < picture->height; ++y) {
-    if (fwrite(src_y, picture->width, 1, f) != 1) return 0;
+    if (fwrite(src_y, picture->width, 1, f) != 1) goto Error;
     if (picture->width & 1) fputc(0, f);  // pad
     src_y += picture->y_stride;
   }
   for (y = 0; y < uv_height; ++y) {
-    if (fwrite(src_u, uv_width, 1, f) != 1) return 0;
-    if (fwrite(src_v, uv_width, 1, f) != 1) return 0;
+    if (fwrite(src_u, uv_width, 1, f) != 1) goto Error;
+    if (fwrite(src_v, uv_width, 1, f) != 1) goto Error;
     src_u += picture->uv_stride;
     src_v += picture->uv_stride;
   }
   for (y = 0; y < alpha_height; ++y) {
-    if (fwrite(src_a, picture->width, 1, f) != 1) return 0;
+    if (fwrite(src_a, picture->width, 1, f) != 1) goto Error;
     if (picture->width & 1) fputc(0, f);  // pad
     src_a += picture->a_stride;
   }
+  ok = 1;
+
+ Error:
   fclose(f);
-  return 1;
+  return ok;
 }
 
 // -----------------------------------------------------------------------------
@@ -571,7 +582,7 @@ static void HelpLong(void) {
   printf("  -qrange <min> <max> .... specifies the permissible quality range\n"
          "                           (default: 0 100)\n");
   printf("  -crop <x> <y> <w> <h> .. crop picture with the given rectangle\n");
-  printf("  -resize <w> <h> ........ resize picture (after any cropping)\n");
+  printf("  -resize <w> <h> ........ resize picture (*after* any cropping)\n");
   printf("  -mt .................... use multi-threading if available\n");
   printf("  -low_memory ............ reduce memory usage (slower encoding)\n");
   printf("  -map <int> ............. print map of extra info\n");
@@ -591,9 +602,8 @@ static void HelpLong(void) {
          "                           green=0xe0 and blue=0xd0\n");
   printf("  -noalpha ............... discard any transparency information\n");
   printf("  -lossless .............. encode image losslessly, default=off\n");
-  printf("  -near_lossless <int> ... use near-lossless image\n"
-         "                           preprocessing (0..100=off), "
-         "default=100\n");
+  printf("  -near_lossless <int> ... use near-lossless image preprocessing\n"
+         "                           (0..100=off), default=100\n");
   printf("  -hint <string> ......... specify image characteristics hint,\n");
   printf("                           one of: photo, picture or graph\n");
 
@@ -620,6 +630,7 @@ static void HelpLong(void) {
   printf("  -af .................... auto-adjust filter strength\n");
   printf("  -pre <int> ............. pre-processing filter\n");
   printf("\n");
+  printf("Supported input formats:\n  %s\n", WebPGetEnabledInputFileFormats());
 }
 
 //------------------------------------------------------------------------------
@@ -646,8 +657,9 @@ static const char* const kErrorMessages[VP8_ENC_ERROR_LAST] = {
 
 //------------------------------------------------------------------------------
 
+// Returns EXIT_SUCCESS on success, EXIT_FAILURE on failure.
 int main(int argc, const char* argv[]) {
-  int return_value = -1;
+  int return_value = EXIT_FAILURE;
   const char* in_file = NULL, *out_file = NULL, *dump_file = NULL;
   FILE* out = NULL;
   int c;
@@ -681,22 +693,22 @@ int main(int argc, const char* argv[]) {
       !WebPPictureInit(&original_picture) ||
       !WebPConfigInit(&config)) {
     fprintf(stderr, "Error! Version mismatch!\n");
-    FREE_WARGV_AND_RETURN(-1);
+    FREE_WARGV_AND_RETURN(EXIT_FAILURE);
   }
 
   if (argc == 1) {
     HelpShort();
-    FREE_WARGV_AND_RETURN(0);
+    FREE_WARGV_AND_RETURN(EXIT_FAILURE);
   }
 
   for (c = 1; c < argc; ++c) {
     int parse_error = 0;
     if (!strcmp(argv[c], "-h") || !strcmp(argv[c], "-help")) {
       HelpShort();
-      FREE_WARGV_AND_RETURN(0);
+      FREE_WARGV_AND_RETURN(EXIT_SUCCESS);
     } else if (!strcmp(argv[c], "-H") || !strcmp(argv[c], "-longhelp")) {
       HelpLong();
-      FREE_WARGV_AND_RETURN(0);
+      FREE_WARGV_AND_RETURN(EXIT_SUCCESS);
     } else if (!strcmp(argv[c], "-o") && c + 1 < argc) {
       out_file = (const char*)GET_WARGV(argv, ++c);
     } else if (!strcmp(argv[c], "-d") && c + 1 < argc) {
@@ -831,9 +843,13 @@ int main(int argc, const char* argv[]) {
 #endif
     } else if (!strcmp(argv[c], "-version")) {
       const int version = WebPGetEncoderVersion();
+      const int sharpyuv_version = SharpYuvGetVersion();
       printf("%d.%d.%d\n",
              (version >> 16) & 0xff, (version >> 8) & 0xff, version & 0xff);
-      FREE_WARGV_AND_RETURN(0);
+      printf("libsharpyuv: %d.%d.%d\n",
+             (sharpyuv_version >> 24) & 0xff, (sharpyuv_version >> 16) & 0xffff,
+             sharpyuv_version & 0xff);
+      FREE_WARGV_AND_RETURN(EXIT_SUCCESS);
     } else if (!strcmp(argv[c], "-progress")) {
       show_progress = 1;
     } else if (!strcmp(argv[c], "-quiet")) {
@@ -895,7 +911,7 @@ int main(int argc, const char* argv[]) {
         if (i == kNumTokens) {
           fprintf(stderr, "Error! Unknown metadata type '%.*s'\n",
                   (int)(token - start), start);
-          FREE_WARGV_AND_RETURN(-1);
+          FREE_WARGV_AND_RETURN(EXIT_FAILURE);
         }
         start = token + 1;
       }
@@ -914,14 +930,14 @@ int main(int argc, const char* argv[]) {
     } else if (argv[c][0] == '-') {
       fprintf(stderr, "Error! Unknown option '%s'\n", argv[c]);
       HelpLong();
-      FREE_WARGV_AND_RETURN(-1);
+      FREE_WARGV_AND_RETURN(EXIT_FAILURE);
     } else {
       in_file = (const char*)GET_WARGV(argv, c);
     }
 
     if (parse_error) {
       HelpLong();
-      FREE_WARGV_AND_RETURN(-1);
+      FREE_WARGV_AND_RETURN(EXIT_FAILURE);
     }
   }
   if (in_file == NULL) {
@@ -1139,9 +1155,10 @@ int main(int argc, const char* argv[]) {
       }
 
       picture.use_argb = 1;
-      if (!ReadWebP(memory_writer.mem, memory_writer.size, &picture,
-                    /*keep_alpha=*/WebPPictureHasTransparency(&picture),
-                    /*metadata=*/NULL)) {
+      if (!ReadWebP(
+              memory_writer.mem, memory_writer.size, &picture,
+              /*keep_alpha=*/WebPPictureHasTransparency(&original_picture),
+              /*metadata=*/NULL)) {
         fprintf(stderr, "Error! Cannot decode encoded WebP bitstream\n");
         fprintf(stderr, "Error code: %d (%s)\n", picture.error_code,
                 kErrorMessages[picture.error_code]);
@@ -1221,7 +1238,7 @@ int main(int argc, const char* argv[]) {
       PrintMetadataInfo(&metadata, metadata_written);
     }
   }
-  return_value = 0;
+  return_value = EXIT_SUCCESS;
 
  Error:
   WebPMemoryWriterClear(&memory_writer);
